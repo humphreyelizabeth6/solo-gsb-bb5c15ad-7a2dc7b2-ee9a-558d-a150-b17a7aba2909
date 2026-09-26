@@ -33,6 +33,23 @@ CREATE TABLE IF NOT EXISTS chain_anchor (
     anchor_seq  INTEGER NOT NULL,                    -- 已压缩归档到的最大 seq
     anchor_hash TEXT NOT NULL                        -- 最后被压缩记录的哈希, 作为后续校验的 prev_hash 起点
 );
+
+CREATE TABLE IF NOT EXISTS quarantined_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- 隔离记录顺序
+    consumer_id    TEXT NOT NULL,                      -- 执行隔离的 consumer
+    event_seq      INTEGER NOT NULL,                   -- 原事件首次接收顺序号(events.id)
+    event_id       TEXT NOT NULL,                      -- 以下 5 列复制自原事件的完整内容
+    occurred_at    TEXT NOT NULL,
+    payload        TEXT NOT NULL,                      -- 原始 JSON 的独立副本
+    received_at    TEXT NOT NULL,
+    event_hash     TEXT,                               -- 原事件哈希, 原记录归档后仍可核对
+    reason         TEXT NOT NULL,                      -- 非空失败原因
+    quarantined_at TEXT NOT NULL,                      -- 隔离时间(UTC ISO8601)
+    lease_token    TEXT NOT NULL                       -- 隔离时使用的租约令牌(审计留痕)
+);
+-- 按 consumer 时间线查询隔离记录; 同一 consumer 不会重复隔离同一 seq(游标已越过, 由消费流程保证)
+CREATE INDEX IF NOT EXISTS idx_quarantine_consumer
+    ON quarantined_events (consumer_id, id);
 """
 
 

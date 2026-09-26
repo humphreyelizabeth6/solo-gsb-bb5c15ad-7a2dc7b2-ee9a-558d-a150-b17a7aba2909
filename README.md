@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-服务监听 **8000** 端口(SQLite 数据持久化在 named volume `webhook-data`)。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -17,6 +17,8 @@ docker build -t webhook-replay . && docker run -p 8000:8000 webhook-replay
 ```
 
 本地开发:`pip install -r requirements.txt && uvicorn app.main:app --port 8000`
+
+**配置**:仅一个环境变量 `DB_PATH`——SQLite 数据库文件路径,默认 `events.db`;compose 镜像内置为 `/data/events.db`(挂载在 `webhook-data` 卷)。
 
 ## 示例 curl
 
@@ -208,7 +210,72 @@ curl -X POST http://localhost:8000/consumers/worker-1/rewind \
 {"detail": "target_seq below chain anchor", "target_seq": 3, "anchor_seq": 4}
 ```
 
-### 9. 安全归档压缩
+### 9. 消费游标:隔离毒丸事件
+
+批次首条事件反复处理失败(毒丸)时,可只隔离这一条、越过它继续消费剩余事件,而不必回退或卡住整个批次:
+
+```bash
+curl -X POST http://localhost:8000/consumers/worker-1/quarantine \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"NcueAr-DjIE5Cjwdn0X5OiSxe9CH_XyCkya2G0vp3sk","reason":"JSON 解析失败: 缺少必填字段 order_id"}'
+```
+
+```json
+{
+  "consumer_id": "worker-1",
+  "quarantined": true,
+  "quarantine_id": 1,
+  "seq": 1,
+  "event_id": "evt-1",
+  "cursor_seq": 1,
+  "quarantined_at": "2026-09-26T12:00:00.000000+00:00"
+}
+```
+
+全部操作在**单个写事务**(`BEGIN IMMEDIATE`)内完成:
+
+1. **核对令牌**:必须存在与 `lease_token` 一致且**未过期**的租约;无租约、租约过期、伪造或旧令牌一律 **409 且状态不变**(与 `ack` 同一套校验)。
+2. **核对租约起点与游标相邻**:`lease_from_seq` 必须等于下一条可投递事件(正常情况下为 `cursor_seq + 1`;压缩归档后才建档的 consumer 游标仍为 0,已归档区间不可投递,起点为 `anchor_seq + 1`)。不相邻返回 409 `lease start not adjacent to cursor`(响应附 `cursor_seq`/`anchor_seq`/`lease_from_seq`/`lease_to_seq`),状态不变。
+3. **复制隔离记录**:把首条事件的**完整内容**(`seq`/`event_id`/`occurred_at`/`payload`/`received_at` 及原事件 `hash`)连同非空 `reason`、隔离时间、所用令牌写入**独立隔离表** `quarantined_events`(不修改、不删除原事件)。
+4. **游标仅越过这一条**:`cursor_seq` 推进到 `lease_from_seq`,同时**清除整批租约**。下一次 `pull` 从该 seq 之后**重新租用剩余事件**(换发新 token);原批次的旧令牌立即作废,再用它调 `ack`/`ack-prefix`/`quarantine` 都是 409。
+
+- **只能隔离首条**:不允许跳过批次中间的事件(与"禁止越序确认"一致);失败原因为空或纯空白由请求校验拦截(**422**)。
+- **单事件批次**:隔离后租约清除,下次 `pull` 返回空批次,直到新事件到达。
+
+查询某 consumer 的隔离记录(按隔离时间分页):
+
+```bash
+curl 'http://localhost:8000/consumers/worker-1/quarantine?page=1&page_size=50'
+```
+
+```json
+{
+  "consumer_id": "worker-1",
+  "total": 1,
+  "page": 1,
+  "page_size": 50,
+  "items": [
+    {
+      "id": 1,
+      "consumer_id": "worker-1",
+      "event": {
+        "seq": 1,
+        "event_id": "evt-1",
+        "occurred_at": "2026-09-26T09:00:01+00:00",
+        "payload": {"a": 1},
+        "received_at": "2026-09-26T11:59:30.000000+00:00",
+        "hash": "2b2f3ae9…(64 位十六进制)"
+      },
+      "reason": "JSON 解析失败: 缺少必填字段 order_id",
+      "quarantined_at": "2026-09-26T12:00:00.000000+00:00"
+    }
+  ]
+}
+```
+
+隔离记录携带的是原事件内容的**独立副本**,因此即使原事件之后被安全归档压缩(`/retention/compact` 物理删除),隔离副本仍可随时查看,并可用 `event.hash` 与归档锚点核对;不同 consumer 的隔离记录互相独立,未知 consumer 返回空列表。
+
+### 10. 安全归档压缩
 
 已确认消费的历史事件可压缩归档:物理删除 `(当前锚点, cutoff_seq]` 的连续事件前缀,并把最后一条被删记录的 `seq`/`hash` 持久化为**链锚点**,`/integrity` 之后从锚点继续校验,历史不可篡改性不受影响。
 
@@ -286,6 +353,7 @@ curl -s http://localhost:8000/integrity
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
 - **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、序号越界均 409 且状态不变。
 - **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
+- **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
@@ -301,6 +369,8 @@ curl -s http://localhost:8000/integrity
 | POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
 | POST | `/consumers/{consumer_id}/ack-prefix` | 确认租约内 `[批次起点, through_seq]` 连续前缀并清除租约,下次 `pull` 从 `through_seq+1` 重租;`through_seq` 到批次末尾即整批确认;未知 consumer/过期/旧 token/越界序号返回 409 |
 | POST | `/consumers/{consumer_id}/rewind` | 游标回退到 `target_seq`(限 `[anchor_seq, cursor_seq]`),下次 `pull` 从 `target_seq+1` 重投;未过期租约/越界/未知 consumer 返回 409 |
+| POST | `/consumers/{consumer_id}/quarantine` | 隔离当前未过期租约的首条事件(带非空 `reason`):单事务核对令牌与租约相邻性、复制完整事件到独立隔离记录、游标越过一条并清除整批租约;无租约/过期/旧令牌/不相邻返回 409,原因为空返回 422 |
+| GET | `/consumers/{consumer_id}/quarantine` | 分页查询该 consumer 的隔离记录;携带原事件完整内容副本,原事件归档后仍可查看 |
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | GET | `/health` | 健康检查 |
 
