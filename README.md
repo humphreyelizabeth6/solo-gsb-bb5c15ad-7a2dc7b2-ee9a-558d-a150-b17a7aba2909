@@ -8,7 +8,9 @@
 docker compose up --build
 ```
 
-服务监听 **8000** 端口(SQLite 数据持久化在 named volume `webhook-data`)。
+服务监听 **8000** 端口,接口入口为 `http://localhost:8000`(交互式文档:`http://localhost:8000/docs`;SQLite 数据持久化在 named volume `webhook-data`)。
+
+**配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`),首次启动自动完成建表初始化,无需手工迁移。
 
 不用 compose 也可以:
 
@@ -185,7 +187,50 @@ curl -X POST http://localhost:8000/consumers/worker-1/pull \
   -H 'Content-Type: application/json' -d '{"limit":100,"lease_seconds":30}'
 ```
 
-### 8. 消费游标:回退重投
+### 8. 消费游标:隔离租约首条事件
+
+批次首条事件反复处理失败(毒消息)时,可把它隔离到独立记录,让批内其余事件继续流转——只接受**当前未过期租约**的 token,且失败原因 `reason` 必须非空:
+
+```bash
+curl -X POST http://localhost:8000/consumers/worker-1/quarantine \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"NcueAr-DjIE5Cjwdn0X5OiSxe9CH_XyCkya2G0vp3sk","reason":"poison message: json parse failed"}'
+```
+
+```json
+{"consumer_id": "worker-1", "quarantined": true, "quarantine_id": 1,
+ "seq": 1, "event_id": "evt-1", "reason": "poison message: json parse failed",
+ "quarantined_at": "2026-09-18T19:40:00.123456+00:00", "cursor_seq": 1}
+```
+
+隔离在**同一个写事务**内完成:核对 token、租约未过期、租约起点与游标相邻(首条事件即游标之后的第一条现存事件)→ 把首条事件的**完整内容**(`seq`/`event_id`/`occurred_at`/`payload`/`received_at`)与失败原因复制到独立的 `quarantine` 表 → **游标仅越过这一条**并**清除整批租约**。下一次 `pull` 从 `lease_from_seq + 1` 起**重新租用剩余事件**(换发新 token),旧 token 立即作废,不能再用于 `ack`/`ack-prefix`/`quarantine`。
+
+以下情况一律返回 **409 且状态不变**(游标与租约均不改动):
+
+- **未知 consumer**,或当前没有租约(从未拉取、已确认完毕、或上次拉取是空批次);
+- token 与当前租约不一致(**伪造**或**旧 token**);
+- 租约**已过期**(过期批次可重投,旧 token 不得再隔离);
+- 租约起点与游标**不相邻**(首条事件不是游标之后的第一条现存事件)。
+
+`reason` 为空或缺失时返回 **422**。
+
+隔离记录按 consumer 分页查询(按隔离先后排序):
+
+```bash
+curl 'http://localhost:8000/consumers/worker-1/quarantine?page=1&page_size=50'
+```
+
+```json
+{"consumer_id": "worker-1", "total": 1, "page": 1, "page_size": 50,
+ "items": [{"quarantine_id": 1, "consumer_id": "worker-1", "seq": 1,
+            "event_id": "evt-1", "occurred_at": "...", "payload": {"a": 1},
+            "received_at": "...", "reason": "poison message: json parse failed",
+            "quarantined_at": "..."}]}
+```
+
+隔离副本**独立于 events 表**保存:原事件被安全归档压缩(见第 10 节)后,这里仍可查看完整副本与失败原因。
+
+### 9. 消费游标:回退重投
 
 处理逻辑出错或需要重放历史时,可把**已登记** consumer 的游标回退到 `target_seq`,下一次 `pull` 从 `target_seq + 1` 重新投递:
 
@@ -208,7 +253,7 @@ curl -X POST http://localhost:8000/consumers/worker-1/rewind \
 {"detail": "target_seq below chain anchor", "target_seq": 3, "anchor_seq": 4}
 ```
 
-### 9. 安全归档压缩
+### 10. 安全归档压缩
 
 已确认消费的历史事件可压缩归档:物理删除 `(当前锚点, cutoff_seq]` 的连续事件前缀,并把最后一条被删记录的 `seq`/`hash` 持久化为**链锚点**,`/integrity` 之后从锚点继续校验,历史不可篡改性不受影响。
 
@@ -285,6 +330,7 @@ curl -s http://localhost:8000/integrity
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
 - **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、序号越界均 409 且状态不变。
+- **首条隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内核对 token、租约未过期、租约起点与游标相邻(首条事件即游标之后的第一条现存事件,压缩归档留下的 seq 空洞不影响判定),把首条事件的完整内容与失败原因复制到独立的 `quarantine` 表,游标仅越过这一条并清除整批租约;下次 `pull` 从 `lease_from_seq + 1` 重新租用剩余事件,旧 token 立即作废。无租约、过期或旧 token 返回 409 且不改状态。隔离副本独立于 events 表,原事件被安全归档压缩后仍可通过 `GET /consumers/{consumer_id}/quarantine` 分页查看。
 - **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
@@ -300,6 +346,8 @@ curl -s http://localhost:8000/integrity
 | POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`) |
 | POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
 | POST | `/consumers/{consumer_id}/ack-prefix` | 确认租约内 `[批次起点, through_seq]` 连续前缀并清除租约,下次 `pull` 从 `through_seq+1` 重租;`through_seq` 到批次末尾即整批确认;未知 consumer/过期/旧 token/越界序号返回 409 |
+| POST | `/consumers/{consumer_id}/quarantine` | 隔离当前未过期租约的首条事件:复制完整内容与失败原因到隔离记录,游标仅越过这一条并清除整批租约,下次 `pull` 重租剩余事件;无租约/过期/旧 token 返回 409 |
+| GET | `/consumers/{consumer_id}/quarantine` | 按 consumer 分页查询隔离记录(`page`/`page_size`);原事件归档压缩后副本仍可查看 |
 | POST | `/consumers/{consumer_id}/rewind` | 游标回退到 `target_seq`(限 `[anchor_seq, cursor_seq]`),下次 `pull` 从 `target_seq+1` 重投;未过期租约/越界/未知 consumer 返回 409 |
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | GET | `/health` | 健康检查 |

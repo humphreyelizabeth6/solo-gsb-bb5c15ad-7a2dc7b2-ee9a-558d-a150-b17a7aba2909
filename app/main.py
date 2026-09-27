@@ -46,6 +46,11 @@ class AckPrefixIn(BaseModel):
     through_seq: int
 
 
+class QuarantineIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, max_length=255)
+    reason: str = Field(..., min_length=1, max_length=1000)  # 失败原因, 非空
+
+
 class RewindIn(BaseModel):
     # 不加下界约束: 低于链锚点(含负数)统一走 409, 而不是 422
     target_seq: int = Field(...)
@@ -80,6 +85,20 @@ def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
         "occurred_at": row["occurred_at"],
         "payload": json.loads(row["payload"]),
         "received_at": row["received_at"],
+    }
+
+
+def row_to_quarantine(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "quarantine_id": row["id"],
+        "consumer_id": row["consumer_id"],
+        "seq": row["seq"],  # 原事件的首次接收顺序号
+        "event_id": row["event_id"],
+        "occurred_at": row["occurred_at"],
+        "payload": json.loads(row["payload"]),
+        "received_at": row["received_at"],
+        "reason": row["reason"],
+        "quarantined_at": row["quarantined_at"],
     }
 
 
@@ -415,6 +434,132 @@ def ack_prefix(
         "acknowledged": True,
         "through_seq": req.through_seq,
         "cursor_seq": req.through_seq,
+    }
+
+
+@app.post("/consumers/{consumer_id}/quarantine")
+def quarantine(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: QuarantineIn = Body(...),
+):
+    """隔离当前未过期租约的首条事件(lease_from_seq), 其余事件留给下次重新租用。
+
+    单个 BEGIN IMMEDIATE 写事务内完成: 核对 token、租约未过期、租约起点与
+    游标相邻(首条事件即游标之后的第一条现存事件) -> 把首条事件的完整内容
+    与失败原因复制到独立的 quarantine 表 -> 游标仅越过这一条并清除整批租约。
+    下次 pull 从 lease_from_seq + 1 重新租用剩余事件(换发新 token),
+    旧 token 立即作废, 不能再 ack / ack-prefix / quarantine。
+
+    未知 consumer、无租约、token 不符(伪造/旧 token)、租约过期或游标不
+    相邻一律 409 且状态不变。隔离副本独立于 events 表保存, 原事件被安全
+    归档压缩后仍可通过 GET /consumers/{consumer_id}/quarantine 查看。
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_from_seq, lease_to_seq,"
+            " lease_expires_at FROM consumers WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        # 未知 consumer / 从未拉取过: 没有可隔离的租约
+        if consumer is None or consumer["lease_token"] is None:
+            return lease_conflict("no active lease")
+        if consumer["lease_token"] != req.lease_token:
+            # 伪造或旧 token(旧批次过期后已被新租约取代, 或已被确认/隔离清除)
+            return lease_conflict("invalid lease token")
+        if datetime.fromisoformat(consumer["lease_expires_at"]) <= now:
+            # 租约已过期, 该批次可被重新投递, 旧 token 不得再隔离
+            return lease_conflict("lease expired")
+        # 租约起点必须与游标相邻: 首条事件即游标之后的第一条现存事件。
+        # 压缩归档会在游标之前留下 seq 空洞, 因此不能简单断言
+        # lease_from_seq == cursor_seq + 1, 而是要求两者之间没有现存事件
+        next_row = conn.execute(
+            "SELECT MIN(id) AS m FROM events WHERE id > ?",
+            (consumer["cursor_seq"],),
+        ).fetchone()
+        if next_row["m"] is None or next_row["m"] != consumer["lease_from_seq"]:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "lease start not adjacent to cursor",
+                    "cursor_seq": consumer["cursor_seq"],
+                    "lease_from_seq": consumer["lease_from_seq"],
+                },
+            )
+
+        first_seq = consumer["lease_from_seq"]
+        event = conn.execute(
+            "SELECT * FROM events WHERE id = ?", (first_seq,)
+        ).fetchone()
+        if event is None:
+            # 防御: 租约指向的首条事件不存在(不应发生), 不改状态
+            return lease_conflict("leased event missing")
+
+        # 同一事务内: 复制完整事件内容与原因到隔离记录
+        quarantined_at = utc_now()
+        cur = conn.execute(
+            "INSERT INTO quarantine (consumer_id, seq, event_id, occurred_at,"
+            " payload, received_at, reason, quarantined_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                consumer_id,
+                event["id"],
+                event["event_id"],
+                event["occurred_at"],
+                event["payload"],
+                event["received_at"],
+                req.reason,
+                quarantined_at,
+            ),
+        )
+        quarantine_id = cur.lastrowid
+        # 同一事务内: 游标仅越过首条, 并清除整批租约
+        conn.execute(
+            "UPDATE consumers SET cursor_seq = ?, lease_token = NULL,"
+            " lease_from_seq = NULL, lease_to_seq = NULL, lease_expires_at = NULL"
+            " WHERE consumer_id = ?",
+            (first_seq, consumer_id),
+        )
+    return {
+        "consumer_id": consumer_id,
+        "quarantined": True,
+        "quarantine_id": quarantine_id,
+        "seq": first_seq,
+        "event_id": event["event_id"],
+        "reason": req.reason,
+        "quarantined_at": quarantined_at,
+        "cursor_seq": first_seq,
+    }
+
+
+@app.get("/consumers/{consumer_id}/quarantine")
+def list_quarantine(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+):
+    """按 consumer 分页查询隔离记录(按隔离先后排序)。
+
+    隔离副本独立于 events 表保存: 原事件被安全归档压缩后, 这里仍可查看
+    完整副本(含失败原因与隔离时间)。
+    """
+    with get_conn() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) AS c FROM quarantine WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()["c"]
+        rows = conn.execute(
+            "SELECT * FROM quarantine WHERE consumer_id = ? ORDER BY id"
+            " LIMIT ? OFFSET ?",
+            (consumer_id, page_size, (page - 1) * page_size),
+        ).fetchall()
+    return {
+        "consumer_id": consumer_id,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [row_to_quarantine(r) for r in rows],
     }
 
 

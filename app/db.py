@@ -33,6 +33,19 @@ CREATE TABLE IF NOT EXISTS chain_anchor (
     anchor_seq  INTEGER NOT NULL,                    -- 已压缩归档到的最大 seq
     anchor_hash TEXT NOT NULL                        -- 最后被压缩记录的哈希, 作为后续校验的 prev_hash 起点
 );
+
+CREATE TABLE IF NOT EXISTS quarantine (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumer_id    TEXT NOT NULL,              -- 隔离该事件的 consumer
+    seq            INTEGER NOT NULL,           -- 原事件的首次接收顺序号
+    event_id       TEXT NOT NULL,              -- 原事件幂等键
+    occurred_at    TEXT NOT NULL,              -- 原事件发生时间(UTC ISO8601)
+    payload        TEXT NOT NULL,              -- 原事件完整 JSON 副本
+    received_at    TEXT NOT NULL,              -- 原事件首次接收时间(UTC ISO8601)
+    reason         TEXT NOT NULL,              -- 失败原因(非空)
+    quarantined_at TEXT NOT NULL               -- 隔离时间(UTC ISO8601)
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_consumer ON quarantine (consumer_id, id);
 """
 
 
